@@ -4,8 +4,10 @@
 
 // Load Wi-Fi library
 #include <ESP8266WiFi.h>
-#include <TM1637.h>
+#include "ESP8266HTTPClient.h"
 #include "DHT.h"
+#include <ArduinoJson.h>
+#include <WiFiClientSecureBearSSL.h>
 #include "arduino_secrets.h"
 
 // Digital pins
@@ -20,7 +22,8 @@ int moisturepin = A0;
 
 const int DHTTYPE = DHT22; // DHT 22  (AM2302)
 
-TM1637 tm(CLK, DIO);
+std::unique_ptr<BearSSL::WiFiClientSecure>client(new BearSSL::WiFiClientSecure);
+HTTPClient https;
 WiFiServer server(80);
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -45,12 +48,11 @@ String humidity_formatted;
 String temperature_formatted;
 String heatindex_formatted;
 
+String fingerprint;
+
 void setup()
 {
     Serial.begin(115200);
-
-    tm.init();
-    tm.set(BRIGHT_TYPICAL);
 
     dht.begin();
 
@@ -64,7 +66,8 @@ void setup()
     Serial.println(SECRET_SSID);
     WiFi.begin(SECRET_SSID, SECRET_PASSWORD);
 
-    while (WiFi.status() != WL_CONNECTED) {
+    while (WiFi.status() != WL_CONNECTED)
+    {
         delay(500);
         Serial.print(".");
     }
@@ -75,12 +78,6 @@ void setup()
     Serial.println("IP address: ");
     Serial.println(WiFi.localIP());
     server.begin();
-
-    // TODO: Change to something useful (such as the temperature)
-    tm.display(0, 0);
-    tm.display(1, 1);
-    tm.display(2, 2);
-    tm.display(3, 3);
 }
 
 int wet = 368;
@@ -144,7 +141,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <span class="dht-labels">Movement</span>
     <span id="movement">%MOVEMENT%</span>
   </p>
-  %LEDBUTTON%
+  %LED_BUTTON%
 </body>
 <script>
 setInterval(function ( ) {
@@ -163,6 +160,52 @@ setInterval(function ( ) {
 </script>
 </html>)rawliteral";
 
+void send_data(const String& entity_id, const String& device_class, float value, const String& unit)
+{
+    // Retrieve SSL fingerprint if not stored already.
+    // Requesting the fingerprint from the website belonging to the SSL certificate's fingerprint
+    // (via HTTP) is typically not so secure. However, in this case we only use it to send simple
+    // sensor data, so there is little risk involved.
+    if (fingerprint == "") {
+        WiFiClient http_client;
+        https.begin(http_client, String(SECRET_HA_URL));
+        https.GET();
+        fingerprint = https.getString();
+        https.end();
+
+        uint fingerprint_length = fingerprint.length() + 1;
+        char fingerprint_char[fingerprint_length];
+        fingerprint.toCharArray(fingerprint_char, fingerprint_length);
+
+        client->setFingerprint(fingerprint_char);
+    }
+
+    DynamicJsonDocument doc(1024);
+
+    doc["state"] = value;
+    doc["attributes"]["unit_of_measurement"] = unit;
+    doc["attributes"]["device_class"] = device_class;
+    doc["attributes"]["attribution"] = "Data provided by NodeMCU";
+
+    String data = "";
+    serializeJson(doc, data);
+
+    String url = SECRET_HA_BASE_URL + "/api/states/" + entity_id;
+    https.begin(*client, url);
+    https.addHeader("Authorization", String("Bearer ") + String(SECRET_TOKEN));
+    https.addHeader("content-type", "application/json");
+
+    int httpCode = https.POST(data);
+
+    if (httpCode > 0)
+    {
+        String payload = https.getString();
+        Serial.println(payload);
+    }
+
+    https.end();
+}
+
 void measure()
 {
     int moisture_value = analogRead(moisturepin);
@@ -177,12 +220,22 @@ void measure()
     humidity_formatted = String(humidity, 1);
     temperature_formatted = String(temperature, 1);
     heatindex_formatted = String(heatindex, 1);
-    movement_formatted = movement_detected == 1 ?
-        "<i class=\"fas fa-check\" style=\"color:#14ab00;\"></i>" :
-        "<i class=\"fas fa-ban\" style=\"color:#f03232;\"></i>";
+    movement_formatted = movement_detected == 1 ? "<i class=\"fas fa-check\" style=\"color:#14ab00;\"></i>" : "<i class=\"fas fa-ban\" style=\"color:#f03232;\"></i>";
+
+    send_data("plant.temperature", "temperature", temperature, "°C");
+    send_data("plant.heatindex", "temperature", heatindex, "°C");
+    send_data("plant.humidity", "humidity", humidity, "%");
+    send_data("plant.moisture_humidity", "humidity", moisture_humidity, "%");
 }
 
 void loop()
+{
+    measure();
+    delay(1000 * 60);
+}
+
+// Rename this to loop (and the above function to something else) to run the webserver.
+void loop2()
 {
     WiFiClient client = server.available();
 
@@ -201,7 +254,6 @@ void loop()
             if (client.available())
             {
                 char c = client.read();
-                Serial.write(c);
                 HTTPheader += c;
 
                 if (c == '\n')
@@ -240,16 +292,15 @@ void loop()
                         }
                         else
                         {
-                            String button_text = ledoutState == "on" ?
-                              "<p><a href=\"/4/on\"><button class=\"button\">ON</button></a></p>" :
-                              "<p><a href=\"/4/off\"><button class=\"button button2\">OFF</button></a></p>";
+                            measure();
+                            String button_html = ledoutState == "on" ? "<p><a href=\"/4/on\"><button class=\"button\">ON</button></a></p>" : "<p><a href=\"/4/off\"><button class=\"button button2\">OFF</button></a></p>";
 
                             String html = String(index_html);
                             html.replace("%TEMPERATURE%", temperature_formatted);
                             html.replace("%HUMIDITY%", humidity_formatted);
                             html.replace("%MOISTURE%", moisture_humidity_formatted);
                             html.replace("%MOVEMENT%", movement_formatted);
-                            html.replace("%LED_BUTTON%", movement_formatted);
+                            html.replace("%LED_BUTTON%", button_html);
 
                             client.println(html);
                         }
