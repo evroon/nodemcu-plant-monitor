@@ -36,7 +36,6 @@ String pumpState = "off";
 
 unsigned long currentTime = millis();
 unsigned long previousUpdateTime = 0;
-unsigned long previousPumpHighTime = 0;
 unsigned long previousTime = 0;
 const long timeoutTime = 2000; // ms
 const long updateTime = 60 * 1000; // ms
@@ -53,6 +52,14 @@ String moisture_humidity_formatted;
 String humidity_formatted;
 String temperature_formatted;
 String heatindex_formatted;
+
+float moisture_threshold = 75.0f;
+int dry_count_threshold = 15;
+int dryCount = 0;
+unsigned long last_pump_time = 0;
+
+String last_pump_time_formatted = "Never";
+String last_pump_unit;
 
 String fingerprint;
 
@@ -95,7 +102,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="style-src 'self' 'unsafe-inline' https://use.fontawesome.com; script-src 'self';">
   <meta charset="utf-8">
-  <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.2/css/all.css" integrity="sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.15.1/css/all.css">
   <title>Plant monitor</title>
   <style>
     html {
@@ -142,13 +149,19 @@ const char index_html[] PROGMEM = R"rawliteral(
   <p>
     <i class="fas fa-seedling" style="color:#0cb504;"></i>
     <span class="dht-labels">Moisture</span>
-    <span id="moisture">%MOISTURE%</span>
+    <span id="moisture" title="Threshold: %MOISTURE_THRESHOLD%%, Dry count threshold: %DRY_COUNT_THRESHOLD%">%MOISTURE%</span>
     <sup class="units">&percnt;</sup>
   </p>
-  <p>
+  <!--<p>
     <i class="fas fa-fighter-jet" style="color:#c75648;"></i>
     <span class="dht-labels">Movement</span>
     <span id="movement">%MOVEMENT%</span>
+  </p>-->
+  <p>
+    <i class="fas fa-faucet" style="color:#363636;"></i>
+    <span class="dht-labels">Last pump time</span>
+    <span id="pump">%LAST_PUMP_TIME%</span>
+    <sup id="pump_unit" class="units">%LAST_PUMP_UNIT%</sup>
   </p>
   %LED_BUTTON%
 </body>
@@ -162,7 +175,9 @@ setInterval(function ( ) {
       document.getElementById("temperature").innerHTML = this.responseText.split("\n")[0];
       document.getElementById("humidity").innerHTML = this.responseText.split("\n")[1];
       document.getElementById("moisture").innerHTML = this.responseText.split("\n")[2];
-      document.getElementById("movement").innerHTML = this.responseText.split("\n")[3];
+//      document.getElementById("movement").innerHTML = this.responseText.split("\n")[3];      
+      document.getElementById("pump").innerHTML = this.responseText.split("\n")[5];
+      document.getElementById("pump_unit").innerHTML = this.responseText.split("\n")[6] + " ago";
     }
   };
   xhttp.open("GET", "/data", true);
@@ -217,6 +232,28 @@ void send_data(const String& entity_id, const String& device_class, float value,
     https.end();
 }
 
+void disable_pump()
+{
+    if (pumpState == "off")
+        return;
+        
+    Serial.println("GPIO 5 off");
+    digitalWrite(pumpPin, HIGH);
+    pumpState = "off";
+}
+
+void activate_pump()
+{
+    if (pumpState == "on")
+        return;
+        
+    Serial.println("GPIO 5 on");
+    digitalWrite(pumpPin, LOW);
+    last_pump_time = millis();
+    dryCount = 0;
+    pumpState = "on";
+}
+
 void measure()
 {
     int moisture_value = analogRead(moisturepin);
@@ -227,7 +264,7 @@ void measure()
     heatindex = dht.computeHeatIndex(temperature, humidity, false);
     movement_detected = digitalRead(pirSensor) == 1;
 
-    moisture_humidity_formatted = String(moisture_humidity, 1);
+    moisture_humidity_formatted = String(moisture_humidity, 0);
     humidity_formatted = String(humidity, 1);
     temperature_formatted = String(temperature, 1);
     heatindex_formatted = String(heatindex, 1);
@@ -237,23 +274,51 @@ void measure()
     send_data("plant.heatindex", "temperature", heatindex, "°C");
     send_data("plant.humidity", "humidity", humidity, "%");
     send_data("plant.moisture_humidity", "humidity", moisture_humidity, "%");
+
+    if (moisture_humidity < moisture_threshold) {
+        dryCount++;
+        if (dryCount > dry_count_threshold) {
+            activate_pump(); 
+        }
+    } else {
+        dryCount = 0;
+    }
 }
 
 void check_for_update()
 {
-  
     currentTime = millis();
+
+    if (currentTime - last_pump_time >= maxPumpTime) {
+        disable_pump();
+    }
 
     if (currentTime - previousUpdateTime >= updateTime || previousUpdateTime == 0) {
         measure();
         previousUpdateTime = currentTime;
     }
 
-    if (currentTime - previousPumpHighTime >= maxPumpTime) {
-        digitalWrite(pumpPin, HIGH);      
-        previousPumpHighTime = currentTime;
-        pumpState = "off";
+    if (last_pump_time == 0)
+        return;
+    
+    int last_pump_time_converted = (currentTime - last_pump_time) / 1000;
+    last_pump_unit = "second(s)";
+    
+    if (last_pump_time_converted > 60) {
+        last_pump_unit = "minute(s)";
+        last_pump_time_converted /= 60;
     }
+    if (last_pump_time_converted > 60) {
+        last_pump_unit = "hour(s)";
+        last_pump_time_converted /= 60;
+    }
+    if (last_pump_time_converted > 24) {
+        last_pump_unit = "day(s)";
+        last_pump_time_converted /= 24;
+    }
+
+    last_pump_unit = last_pump_unit + " ago";
+    last_pump_time_formatted = String(last_pump_time_converted);
 }
 
 // Rename this to loop (and the above function to something else) to run the webserver.
@@ -305,6 +370,8 @@ void loop()
                             client.println(moisture_humidity_formatted);
                             client.println(movement_formatted);
                             client.println(heatindex_formatted);
+                            client.println(last_pump_time_formatted);
+                            client.println(last_pump_unit);
                             break;
                         } else if (HTTPheader.indexOf("GET /index.js") >= 0)
                         {
@@ -314,18 +381,9 @@ void loop()
                         
                         // Turns the GPIOs on and off
                         if (HTTPheader.indexOf("GET /5/on") >= 0)
-                        {
-                            Serial.println("GPIO 5 on");
-                            pumpState = "on";
-                            digitalWrite(pumpPin, LOW);
-                            previousPumpHighTime = millis();
-                        }
+                            activate_pump();
                         else if (HTTPheader.indexOf("GET /5/off") >= 0)
-                        {
-                            Serial.println("GPIO 5 off");
-                            pumpState = "off";
-                            digitalWrite(pumpPin, HIGH);
-                        }
+                            disable_pump();
                         
                         String button_html = pumpState != "on" ? "<p><a href=\"/5/on\"><button class=\"button\">TURN ON</button></a></p>" : "<p><a href=\"/5/off\"><button class=\"button button2\">TURN OFF</button></a></p>";
 
@@ -333,7 +391,11 @@ void loop()
                         html.replace("%TEMPERATURE%", temperature_formatted);
                         html.replace("%HUMIDITY%", humidity_formatted);
                         html.replace("%MOISTURE%", moisture_humidity_formatted);
+                        html.replace("%MOISTURE_THRESHOLD%", String(moisture_threshold, 0));
+                        html.replace("%DRY_COUNT_THRESHOLD%", String(dry_count_threshold));
                         html.replace("%MOVEMENT%", movement_formatted);
+                        html.replace("%LAST_PUMP_TIME%", last_pump_time_formatted);
+                        html.replace("%LAST_PUMP_UNIT%", last_pump_unit);
                         html.replace("%LED_BUTTON%", button_html);
 
                         client.println(html);
