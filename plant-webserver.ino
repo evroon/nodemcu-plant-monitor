@@ -4,7 +4,7 @@
 
 // Load Wi-Fi library
 #include <ESP8266WiFi.h>
-#include "ESP8266HTTPClient.h"
+#include <ESP8266HTTPClient.h>
 #include "DHT.h"
 #include <ArduinoJson.h>
 #include <WiFiClientSecureBearSSL.h>
@@ -13,16 +13,18 @@
 // Digital pins
 const int DHTPIN = D1;
 const int pirSensor = D3;
-const int ledout = D4;
 const int CLK = D8;
 const int DIO = D7;
 
 // Analog pins
 int moisturepin = A0;
 
+const int pumpPin = D5;
+
 const int DHTTYPE = DHT22; // DHT 22  (AM2302)
 
-std::unique_ptr<BearSSL::WiFiClientSecure>client(new BearSSL::WiFiClientSecure);
+//std::unique_ptr<BearSSL::WiFiClientSecure>client(new BearSSL::WiFiClientSecure);
+WiFiClient client;
 HTTPClient https;
 WiFiServer server(80);
 DHT dht(DHTPIN, DHTTYPE);
@@ -30,11 +32,15 @@ DHT dht(DHTPIN, DHTTYPE);
 // Variable to store the HTTP request
 String HTTPheader;
 
-String ledoutState = "off";
+String pumpState = "off";
 
 unsigned long currentTime = millis();
+unsigned long previousUpdateTime = 0;
+unsigned long previousPumpHighTime = 0;
 unsigned long previousTime = 0;
 const long timeoutTime = 2000; // ms
+const long updateTime = 60 * 1000; // ms
+const long maxPumpTime = 5 * 1000; // ms
 
 float temperature;
 float humidity;
@@ -56,10 +62,10 @@ void setup()
 
     dht.begin();
 
-    pinMode(ledout, OUTPUT);
+    pinMode(pumpPin, OUTPUT);
     pinMode(moisturepin, INPUT);
 
-    digitalWrite(ledout, LOW);
+    digitalWrite(pumpPin, HIGH);
 
     // Connect to Wi-Fi network with SSID and password
     Serial.print("Connecting to ");
@@ -87,6 +93,8 @@ const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="style-src 'self' 'unsafe-inline' https://use.fontawesome.com; script-src 'self';">
+  <meta charset="utf-8">
   <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.2/css/all.css" integrity="sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr" crossorigin="anonymous">
   <title>Plant monitor</title>
   <style>
@@ -115,6 +123,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         cursor: pointer;
     }
   </style>
+  <script type="text/javascript" src="/index.js"></script>
 </head>
 <body>
   <h2>Plant Monitor</h2>
@@ -143,7 +152,9 @@ const char index_html[] PROGMEM = R"rawliteral(
   </p>
   %LED_BUTTON%
 </body>
-<script>
+</html>)rawliteral";
+
+const char index_js[] PROGMEM = R"rawliteral(
 setInterval(function ( ) {
   var xhttp = new XMLHttpRequest();
   xhttp.onreadystatechange = function() {
@@ -156,9 +167,7 @@ setInterval(function ( ) {
   };
   xhttp.open("GET", "/data", true);
   xhttp.send();
-}, 10000 ) ;
-</script>
-</html>)rawliteral";
+}, 60000);)rawliteral";
 
 void send_data(const String& entity_id, const String& device_class, float value, const String& unit)
 {
@@ -166,9 +175,10 @@ void send_data(const String& entity_id, const String& device_class, float value,
     // Requesting the fingerprint from the website belonging to the SSL certificate's fingerprint
     // (via HTTP) is typically not so secure. However, in this case we only use it to send simple
     // sensor data, so there is little risk involved.
-    if (fingerprint == "") {
+    if (fingerprint == "" && SECRET_FINGERPRINT_URL != "") {
+        Serial.println("Obtaining fingerprint...");
         WiFiClient http_client;
-        https.begin(http_client, String(SECRET_HA_URL));
+        https.begin(http_client, String(SECRET_FINGERPRINT_URL));
         https.GET();
         fingerprint = https.getString();
         https.end();
@@ -177,7 +187,7 @@ void send_data(const String& entity_id, const String& device_class, float value,
         char fingerprint_char[fingerprint_length];
         fingerprint.toCharArray(fingerprint_char, fingerprint_length);
 
-        client->setFingerprint(fingerprint_char);
+//        client->setFingerprint(fingerprint_char);
     }
 
     DynamicJsonDocument doc(1024);
@@ -190,18 +200,19 @@ void send_data(const String& entity_id, const String& device_class, float value,
     String data = "";
     serializeJson(doc, data);
 
-    String url = SECRET_HA_BASE_URL + "/api/states/" + entity_id;
-    https.begin(*client, url);
+    String url = SECRET_HA_BASE_URL "/api/states/" + entity_id;
+    https.begin(client, url);
     https.addHeader("Authorization", String("Bearer ") + String(SECRET_TOKEN));
     https.addHeader("content-type", "application/json");
+    
+    Serial.print("Updating entity: ");
+    Serial.print(entity_id);
+    Serial.print(" at: ");
+    Serial.println(url);
 
     int httpCode = https.POST(data);
-
-    if (httpCode > 0)
-    {
-        String payload = https.getString();
-        Serial.println(payload);
-    }
+    String payload = https.getString();
+    Serial.println(payload);
 
     https.end();
 }
@@ -228,15 +239,28 @@ void measure()
     send_data("plant.moisture_humidity", "humidity", moisture_humidity, "%");
 }
 
-void loop()
+void check_for_update()
 {
-    measure();
-    delay(1000 * 60);
+  
+    currentTime = millis();
+
+    if (currentTime - previousUpdateTime >= updateTime || previousUpdateTime == 0) {
+        measure();
+        previousUpdateTime = currentTime;
+    }
+
+    if (currentTime - previousPumpHighTime >= maxPumpTime) {
+        digitalWrite(pumpPin, HIGH);      
+        previousPumpHighTime = currentTime;
+        pumpState = "off";
+    }
 }
 
 // Rename this to loop (and the above function to something else) to run the webserver.
-void loop2()
+void loop()
 {
+    check_for_update();
+    
     WiFiClient client = server.available();
 
     if (client)
@@ -263,47 +287,56 @@ void loop2()
                     // that's the end of the client HTTP request, so send a response:
                     if (currentLine.length() == 0)
                     {
+                        bool is_script = HTTPheader.indexOf("GET /index.js") >= 0;
                         client.println("HTTP/1.1 200 OK");
-                        client.println("Content-type:text/html");
+                        
+                        if (is_script)
+                            client.println("Content-type:application/javascript");
+                        else
+                            client.println("Content-type:text/html");
+                            
                         client.println("Connection: close");
                         client.println();
-
-                        // Turns the GPIOs on and off
-                        if (HTTPheader.indexOf("GET /4/on") >= 0)
+                        
+                        if (HTTPheader.indexOf("GET /data") >= 0)
                         {
-                            Serial.println("GPIO 4 on");
-                            ledoutState = "on";
-                            digitalWrite(ledout, HIGH);
-                        }
-                        else if (HTTPheader.indexOf("GET /4/off") >= 0)
-                        {
-                            Serial.println("GPIO 4 off");
-                            ledoutState = "off";
-                            digitalWrite(ledout, LOW);
-                        }
-                        else if (HTTPheader.indexOf("GET /data") >= 0)
-                        {
-                            measure();
                             client.println(temperature_formatted);
                             client.println(humidity_formatted);
                             client.println(moisture_humidity_formatted);
                             client.println(movement_formatted);
                             client.println(heatindex_formatted);
-                        }
-                        else
+                            break;
+                        } else if (HTTPheader.indexOf("GET /index.js") >= 0)
                         {
-                            measure();
-                            String button_html = ledoutState == "on" ? "<p><a href=\"/4/on\"><button class=\"button\">ON</button></a></p>" : "<p><a href=\"/4/off\"><button class=\"button button2\">OFF</button></a></p>";
-
-                            String html = String(index_html);
-                            html.replace("%TEMPERATURE%", temperature_formatted);
-                            html.replace("%HUMIDITY%", humidity_formatted);
-                            html.replace("%MOISTURE%", moisture_humidity_formatted);
-                            html.replace("%MOVEMENT%", movement_formatted);
-                            html.replace("%LED_BUTTON%", button_html);
-
-                            client.println(html);
+                            client.println(String(index_js));
+                            break;
                         }
+                        
+                        // Turns the GPIOs on and off
+                        if (HTTPheader.indexOf("GET /5/on") >= 0)
+                        {
+                            Serial.println("GPIO 5 on");
+                            pumpState = "on";
+                            digitalWrite(pumpPin, LOW);
+                            previousPumpHighTime = millis();
+                        }
+                        else if (HTTPheader.indexOf("GET /5/off") >= 0)
+                        {
+                            Serial.println("GPIO 5 off");
+                            pumpState = "off";
+                            digitalWrite(pumpPin, HIGH);
+                        }
+                        
+                        String button_html = pumpState != "on" ? "<p><a href=\"/5/on\"><button class=\"button\">TURN ON</button></a></p>" : "<p><a href=\"/5/off\"><button class=\"button button2\">TURN OFF</button></a></p>";
+
+                        String html = String(index_html);
+                        html.replace("%TEMPERATURE%", temperature_formatted);
+                        html.replace("%HUMIDITY%", humidity_formatted);
+                        html.replace("%MOISTURE%", moisture_humidity_formatted);
+                        html.replace("%MOVEMENT%", movement_formatted);
+                        html.replace("%LED_BUTTON%", button_html);
+
+                        client.println(html);
                         break;
                     }
                     else
@@ -320,8 +353,5 @@ void loop2()
 
         HTTPheader = "";
         client.stop();
-
-        Serial.println("Client disconnected.");
-        Serial.println("");
     }
 }
